@@ -5,7 +5,7 @@ private func debugLog(_ message: String, file: String = #fileID, function: Strin
 }
 
 @main
-struct video_thumbnailApp: App {
+struct S3UploadApp: App {
     init() {
         debugLog("App init")
     }
@@ -17,5 +17,10 @@ struct video_thumbnailApp: App {
                 }
         }
         .windowStyle(.titleBar)
+
+        // macOS Settings window
+        Settings {
+            SettingsView()
+        }
     }
 }

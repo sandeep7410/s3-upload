@@ -43,7 +43,6 @@ struct S3Browser: View {
                         Button(action: { navigateToPath(crumb.key) }) {
                             Text(crumb.title)
                                 .font(.caption)
-//                                .foregroundStyle(index == breadcrumbs.count - 1 ? .primary : .blue)
                                 .underline(index != breadcrumbs.count - 1)
                                 .padding(.horizontal, 4)
                                 .padding(.vertical, 2)
@@ -63,10 +62,13 @@ struct S3Browser: View {
             HStack {
                 Button {
                     debugLog("Select current folder tapped: '\(currentPrefix)'")
-                    selectPath(currentPrefix)
+                    toggleSelectPathForCurrentFolder()
                 } label: {
-                    Label("Select this folder", systemImage: "checkmark.circle")
-                        .font(.subheadline)
+                    Label(
+                        isCurrentFolderSelected ? "Unselect this folder" : "Select this folder",
+                        systemImage: isCurrentFolderSelected ? "checkmark.circle.fill" : "checkmark.circle"
+                    )
+                    .font(.subheadline)
                 }
                 .disabled(currentPrefix.isEmpty)
 
@@ -104,19 +106,19 @@ struct S3Browser: View {
                 LazyVStack(alignment: .leading, spacing: 4) {
                     ForEach(items) { item in
                         HStack(spacing: 8) {
-                            // Move tick to the leading side
+                            // Leading tick that toggles selection for folders
                             if item.isFolder {
                                 Button(action: {
                                     debugLog("Select folder tapped: key='\(item.key)'")
-                                    selectPath(item.key)
+                                    toggleSelectPath(forFolderKey: item.key)
                                 }) {
-                                    Image(systemName: selectedPath.contains(item.key) ? "checkmark.circle.fill" : "checkmark.circle")
-                                        .foregroundStyle(selectedPath.contains(item.key) ? .green : .gray)
+                                    Image(systemName: isFolderKeySelected(item.key) ? "checkmark.circle.fill" : "checkmark.circle")
+                                        .foregroundStyle(isFolderKeySelected(item.key) ? .green : .gray)
                                         .font(.title3)
                                         .padding(6)
                                 }
                                 .buttonStyle(.plain)
-                                .help("Select this folder for upload")
+                                .help(isFolderKeySelected(item.key) ? "Unselect this folder" : "Select this folder for upload")
                             } else {
                                 // spacer to align with folders
                                 Image(systemName: "circle")
@@ -232,6 +234,42 @@ struct S3Browser: View {
                 }
             }
         }
+    }
+    
+    // MARK: - Selection
+    
+    // Normalizes "bucket/key" with a trailing slash for folders
+    private func normalizedPath(forFolderKey key: String) -> String {
+        if key.hasSuffix("/") {
+            return "\(bucketName)/\(key)"
+        } else {
+            return "\(bucketName)/\(key)/"
+        }
+    }
+    
+    private func isFolderKeySelected(_ key: String) -> Bool {
+        selectedPath == normalizedPath(forFolderKey: key)
+    }
+    
+    private var isCurrentFolderSelected: Bool {
+        guard !currentPrefix.isEmpty else { return false }
+        return selectedPath == normalizedPath(forFolderKey: currentPrefix)
+    }
+    
+    private func toggleSelectPath(forFolderKey key: String) {
+        let path = normalizedPath(forFolderKey: key)
+        if selectedPath == path {
+            selectedPath = ""
+            debugLog("toggleSelectPath: cleared selection (was '\(path)')")
+        } else {
+            selectedPath = path
+            debugLog("toggleSelectPath: selected '\(path)'")
+        }
+    }
+    
+    private func toggleSelectPathForCurrentFolder() {
+        guard !currentPrefix.isEmpty else { return }
+        toggleSelectPath(forFolderKey: currentPrefix)
     }
     
     private func selectPath(_ key: String) {

@@ -3,98 +3,113 @@ import AWSS3
 import AWSClientRuntime
 import Smithy
 import AWSSDKIdentity
+import SmithyIdentity
+import Combine
 
 private func debugLog(_ message: String, file: String = #fileID, function: String = #function, line: Int = #line) {
     print("🪵 [\(file):\(line)] \(function) — \(message)")
 }
 
 final class S3Service {
-    private let profileName = "nasa-personal"
-    private let region = "us-east-1"
-    private let s3Client: S3Client
-    
+    // Lazily created client; built when credentials become available.
+    private var s3Client: S3Client?
+    private var settingsCancellable: AnyCancellable?
+
     init() {
-        debugLog("Initializing S3Service with profile='\(profileName)', region='\(region)'")
-        let profileResolver = ProfileAWSCredentialIdentityResolver(profileName: profileName)
+        debugLog("S3Service init (no immediate credential requirement)")
+
+        // Observe settings changes and invalidate client automatically so that
+        // next API call rebuilds the client with latest credentials/region.
+        let settings = AWSSettings.shared
+
+        // Merge changes from each @Published property into a single stream of Void
+        let useCustom = settings.$useCustomCredentials.map { _ in () }.eraseToAnyPublisher()
+        let accessKey = settings.$accessKeyId.map { _ in () }.eraseToAnyPublisher()
+        let secretKey = settings.$secretAccessKey.map { _ in () }.eraseToAnyPublisher()
+        let region = settings.$region.map { _ in () }.eraseToAnyPublisher()
+
+        settingsCancellable = Publishers.MergeMany([useCustom, accessKey, secretKey, region])
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                debugLog("AWSSettings changed -> invalidating S3 client")
+                self?.invalidateClient()
+            }
+    }
+
+    deinit {
+        settingsCancellable?.cancel()
+    }
+
+    // Builds the client from current settings (no session token, no fallback).
+    // Returns a ready client or throws if settings are invalid.
+    private func ensureClientReady() throws -> S3Client {
+        if let client = s3Client {
+            return client
+        }
+
+        let settings = AWSSettings.shared
+        let accessKey = settings.accessKeyId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secretKey = settings.secretAccessKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let region = settings.region.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard settings.useCustomCredentials,
+              !accessKey.isEmpty,
+              !secretKey.isEmpty,
+              !region.isEmpty
+        else {
+            debugLog("ensureClientReady: credentials missing or disabled")
+            throw S3Error.credentialsNotFound
+        }
+
+        debugLog("ensureClientReady: building S3Client for region='\(region)' using custom credentials")
+
+        let creds = AWSCredentialIdentity(
+            accessKey: accessKey,
+            secret: secretKey
+            // no session token
+        )
+        let resolver = StaticAWSCredentialIdentityResolver(creds)
+
         do {
             let configuration = try S3Client.S3ClientConfiguration(
-                awsCredentialIdentityResolver: profileResolver,
+                awsCredentialIdentityResolver: resolver,
                 region: region
             )
-            //https://sandeep-nallapati.s3.us-east-1.amazonaws.com/gallery/
-            s3Client = S3Client(config: configuration)
-            debugLog("S3Client initialized successfully: \(s3Client), \(configuration)")
+            let client = S3Client(config: configuration)
+            self.s3Client = client
+            debugLog("ensureClientReady: S3Client built successfully")
+            return client
         } catch {
-            debugLog("Failed to initialize S3Client configuration: \(error.localizedDescription)")
-            fatalError("Failed to initialize S3Client configuration: \(error.localizedDescription)")
+            debugLog("ensureClientReady: failed to create S3Client config: \(error.localizedDescription)")
+            throw error
         }
     }
-    
-    private func loadCredentials() throws -> (accessKey: String?, secretKey: String?) {
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
-        let credentialsPath = homeDir.appendingPathComponent(".aws/credentials")
-        debugLog("Attempting to load credentials from \(credentialsPath.path)")
-        
-        guard let credentialsContent = try? String(contentsOf: credentialsPath) else {
-            debugLog("Credentials file not found or unreadable at path")
-            return (nil, nil)
-        }
-        
-        var accessKey: String?
-        var secretKey: String?
-        var inProfile = false
-        
-        for line in credentialsContent.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty || trimmed.hasPrefix("#") {
-                continue
-            }
-            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
-                let profile = String(trimmed.dropFirst().dropLast())
-                inProfile = (profile == profileName)
-                continue
-            }
-            if inProfile {
-                if trimmed.hasPrefix("aws_access_key_id") {
-                    let parts = trimmed.split(separator: "=", maxSplits: 1)
-                    if parts.count == 2 {
-                        accessKey = String(parts[1]).trimmingCharacters(in: .whitespaces)
-                    }
-                } else if trimmed.hasPrefix("aws_secret_access_key") {
-                    let parts = trimmed.split(separator: "=", maxSplits: 1)
-                    if parts.count == 2 {
-                        secretKey = String(parts[1]).trimmingCharacters(in: .whitespaces)
-                    }
-                }
-            }
-        }
-        
-        if let accessKey = accessKey, let secretKey = secretKey, !accessKey.isEmpty, !secretKey.isEmpty {
-            debugLog("Successfully loaded credentials for profile: \(profileName)")
-        } else {
-            debugLog("Warning: Could not find credentials for profile '\(profileName)'")
-        }
-        
-        return (accessKey, secretKey)
+
+    // Call this if settings change to force a rebuild on next call.
+    func invalidateClient() {
+        debugLog("invalidateClient: clearing S3 client")
+        s3Client = nil
     }
-    
+
     // MARK: - Listing Operations
-    
+
     func listBuckets() async throws -> [String] {
         debugLog("listBuckets start")
+        let client = try ensureClientReady()
         let input = ListBucketsInput()
-        let output = try await s3Client.listBuckets(input: input)
+        let output = try await client.listBuckets(input: input)
         let names = output.buckets?.compactMap { $0.name } ?? []
         debugLog("listBuckets success. count=\(names.count)")
         return names
     }
-    
+
     func listObjects(bucket: String, prefix: String = "") async throws -> [S3Item] {
-        debugLog("listObjects start. bucket='\(bucket)', prefix='\(prefix)', region='\(region)'")
+        let client = try ensureClientReady()
+        debugLog("listObjects start. bucket='\(bucket)', prefix='\(prefix)'")
         var collected: [S3Item] = []
         var continuationToken: String? = nil
         var pageIndex = 0
-//        _ = try await s3Client.headBucket(input: .init(bucket: "sandeep-nallapati"))
+
         repeat {
             pageIndex += 1
             var input = ListObjectsV2Input(
@@ -103,17 +118,17 @@ final class S3Service {
                 prefix: prefix.isEmpty ? nil : prefix
             )
             input.continuationToken = continuationToken
-            
+
             debugLog("Request page \(pageIndex): delimiter='/', prefix='\(input.prefix ?? "")', continuationToken='\(continuationToken ?? "nil")'")
-            
+
             do {
-                let output = try await s3Client.listObjectsV2(input: input)
-                
+                let output = try await client.listObjectsV2(input: input)
+
                 let commonPrefixesCount = output.commonPrefixes?.count ?? 0
                 let contentsCount = output.contents?.count ?? 0
                 debugLog("Response page \(pageIndex): commonPrefixes=\(commonPrefixesCount), contents=\(contentsCount), isTruncated=\(output.isTruncated ?? false)")
-                
-                // Folders (common prefixes)
+
+                // Folders
                 if let commonPrefixes = output.commonPrefixes {
                     for (i, commonPrefix) in commonPrefixes.enumerated() {
                         if let prefixPath = commonPrefix.prefix {
@@ -131,8 +146,8 @@ final class S3Service {
                         }
                     }
                 }
-                
-                // Files (contents)
+
+                // Files
                 if let contents = output.contents {
                     for (i, object) in contents.enumerated() {
                         guard let key = object.key else {
@@ -149,7 +164,7 @@ final class S3Service {
                         debugLog("  [File \(i)] name='\(name)', key='\(key)', size=\(size ?? -1)")
                     }
                 }
-                
+
                 continuationToken = output.nextContinuationToken
                 debugLog("Page \(pageIndex) processed. collectedTotal=\(collected.count), nextToken='\(continuationToken ?? "nil")'")
             } catch {
@@ -158,11 +173,10 @@ final class S3Service {
                 if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
                     debugLog("Underlying error: domain='\(underlying.domain)', code=\(underlying.code), userInfo=\(underlying.userInfo)")
                 }
-                debugLog("Hint: Check DNS/proxy/network. Ensure region '\(region)' is correct for bucket '\(bucket)'.")
                 throw error
             }
         } while continuationToken != nil
-        
+
         debugLog("Sorting \(collected.count) items: folders-first, then files, by name")
         let sorted = collected.sorted { first, second in
             if first.isFolder != second.isFolder {
@@ -175,22 +189,23 @@ final class S3Service {
         debugLog("listObjects complete. total=\(sorted.count) (folders=\(foldersCount), files=\(filesCount))")
         return sorted
     }
-    
+
     // MARK: - Upload Operations
-    
+
     func uploadFile(
         localPath: URL,
         bucket: String,
         key: String,
         storageClass: S3StorageClass = .standard
     ) async throws {
+        let client = try ensureClientReady()
         debugLog("uploadFile start. local='\(localPath.path)', bucket='\(bucket)', key='\(key)', storageClass=\(storageClass.rawValue)")
         let fileData = try Data(contentsOf: localPath)
         let contentType = getContentType(for: localPath)
         debugLog("uploadFile read data. size=\(fileData.count) bytes, contentType='\(contentType)'")
-        
+
         let awsStorageClass = mapStorageClass(storageClass)
-        
+
         var input = PutObjectInput(
             body: .data(fileData),
             bucket: bucket,
@@ -200,13 +215,13 @@ final class S3Service {
         if let storageClass = awsStorageClass {
             input.storageClass = storageClass
         }
-        
-        _ = try await s3Client.putObject(input: input)
+
+        _ = try await client.putObject(input: input)
         debugLog("uploadFile success: s3://\(bucket)/\(key)")
     }
-    
+
     // MARK: - Helper Methods
-    
+
     private func mapStorageClass(_ sc: S3StorageClass) -> S3ClientTypes.StorageClass? {
         switch sc {
         case .standard:
@@ -215,7 +230,7 @@ final class S3Service {
             return .deepArchive
         }
     }
-    
+
     private func getContentType(for url: URL) -> String {
         let pathExtension = url.pathExtension.lowercased()
         let contentTypes: [String: String] = [
@@ -255,11 +270,11 @@ enum S3Error: LocalizedError {
     case requestFailed
     case invalidURL
     case uploadFailed
-    
+
     var errorDescription: String? {
         switch self {
         case .credentialsNotFound:
-            return "AWS credentials not found. Please configure ~/.aws/credentials"
+            return "AWS credentials are required. Open Settings and fill Access Key ID, Secret Access Key, and Region, then enable 'Use custom credentials'."
         case .requestFailed:
             return "S3 request failed"
         case .invalidURL:

@@ -16,9 +16,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "DA78E6D42EBE167500B68972"
-               BuildableName = "video-thumbnail.app"
-               BlueprintName = "video-thumbnail"
-               ReferencedContainer = "container:video-thumbnail.xcodeproj">
+               BuildableName = "S3 Upload.app"
+               BlueprintName = "S3 Upload"
+               ReferencedContainer = "container:S3 Upload.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -45,23 +45,11 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "DA78E6D42EBE167500B68972"
-            BuildableName = "video-thumbnail.app"
-            BlueprintName = "video-thumbnail"
-            ReferencedContainer = "container:video-thumbnail.xcodeproj">
+            BuildableName = "S3 Upload.app"
+            BlueprintName = "S3 Upload"
+            ReferencedContainer = "container:S3 Upload.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
-      <EnvironmentVariables>
-         <EnvironmentVariable
-            key = "AWS_SDK_LOG_LEVEL"
-            value = "debug"
-            isEnabled = "YES">
-         </EnvironmentVariable>
-         <EnvironmentVariable
-            key = "AWS_HTTP_TRACE"
-            value = "1"
-            isEnabled = "YES">
-         </EnvironmentVariable>
-      </EnvironmentVariables>
    </LaunchAction>
    <ProfileAction
       buildConfiguration = "Release"
@@ -74,9 +62,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "DA78E6D42EBE167500B68972"
-            BuildableName = "video-thumbnail.app"
-            BlueprintName = "video-thumbnail"
-            ReferencedContainer = "container:video-thumbnail.xcodeproj">
+            BuildableName = "S3 Upload.app"
+            BlueprintName = "S3 Upload"
+            ReferencedContainer = "container:S3 Upload.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>
