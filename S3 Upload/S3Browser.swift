@@ -21,7 +21,7 @@ struct S3Item: Identifiable, Hashable {
 
 struct S3Browser: View {
     @Binding var selectedPath: String
-    private let bucketName = "sandeep-nallapati"
+    @ObservedObject private var settings = AWSSettings.shared
     @State private var currentPrefix: String = ""
     @State private var items: [S3Item] = []
     @State private var isLoading: Bool = false
@@ -70,7 +70,7 @@ struct S3Browser: View {
                     )
                     .font(.subheadline)
                 }
-                .disabled(currentPrefix.isEmpty)
+                .disabled(currentPrefix.isEmpty || settings.bucketName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 Spacer()
 
@@ -171,12 +171,17 @@ struct S3Browser: View {
         .onAppear {
             loadRoot()
         }
+        .onChange(of: settings.bucketName) { _, _ in
+            // When bucket changes, reset navigation and reload
+            loadRoot()
+        }
     }
     
     // MARK: - Loading and Navigation
     
     private var breadcrumbs: [(title: String, key: String)] {
-        var crumbs: [(String, String)] = [("s3://\(bucketName)", "")]
+        let bucket = settings.bucketName.trimmingCharacters(in: .whitespacesAndNewlines)
+        var crumbs: [(String, String)] = [("s3://\(bucket.isEmpty ? "—" : bucket)", "")]
         guard !currentPrefix.isEmpty else { return crumbs }
         let parts = currentPrefix.split(separator: "/").filter { !$0.isEmpty }
         var running = ""
@@ -212,13 +217,22 @@ struct S3Browser: View {
     }
     
     private func load(prefix: String) {
+        let bucket = settings.bucketName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bucket.isEmpty else {
+            items = []
+            isLoading = false
+            errorMessage = "Set a bucket name in Settings."
+            debugLog("load aborted: empty bucket name in settings")
+            return
+        }
+
         isLoading = true
         errorMessage = nil
-        debugLog("load called with prefix='\(prefix)'")
+        debugLog("load called with bucket='\(bucket)', prefix='\(prefix)'")
         
         Task {
             do {
-                let listed = try await s3Lister.listObjects(bucket: bucketName, prefix: prefix)
+                let listed = try await s3Lister.listObjects(bucket: bucket, prefix: prefix)
                 await MainActor.run {
                     self.items = listed
                     self.isLoading = false
@@ -240,10 +254,11 @@ struct S3Browser: View {
     
     // Normalizes "bucket/key" with a trailing slash for folders
     private func normalizedPath(forFolderKey key: String) -> String {
+        let bucket = settings.bucketName.trimmingCharacters(in: .whitespacesAndNewlines)
         if key.hasSuffix("/") {
-            return "\(bucketName)/\(key)"
+            return "\(bucket)/\(key)"
         } else {
-            return "\(bucketName)/\(key)/"
+            return "\(bucket)/\(key)/"
         }
     }
     
@@ -273,10 +288,11 @@ struct S3Browser: View {
     }
     
     private func selectPath(_ key: String) {
+        let bucket = settings.bucketName.trimmingCharacters(in: .whitespacesAndNewlines)
         if key.hasSuffix("/") {
-            selectedPath = "\(bucketName)/\(key)"
+            selectedPath = "\(bucket)/\(key)"
         } else {
-            selectedPath = "\(bucketName)/\(key)/"
+            selectedPath = "\(bucket)/\(key)/"
         }
         debugLog("selectPath: key='\(key)', selectedPath='\(selectedPath)'")
     }

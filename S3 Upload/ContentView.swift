@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import AVFoundation
+import Combine
 
 private func debugLog(_ message: String, file: String = #fileID, function: String = #function, line: Int = #line) {
     print("🪵 [\(file):\(line)] \(function) — \(message)")
@@ -61,6 +62,13 @@ struct ContentView: View {
     // Approximate 10 cm height in points
     private let tenCentimetersPoints: CGFloat = 380
 
+    // Incoming files from “Open With…”
+    @EnvironmentObject private var router: OpenFilesRouter
+
+    // Timer to refresh elapsed time while uploading
+    @State private var elapsedTick: Int = 0
+    private let elapsedTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+
     var body: some View {
         VStack(spacing: 16) {
             Text("S3 Upload")
@@ -81,8 +89,25 @@ struct ContentView: View {
             // Selected files list
             if !uploadQueue.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Files to upload (\(uploadQueue.count))")
-                        .font(.headline)
+                    HStack {
+                        Text("Files to upload (\(uploadQueue.count))")
+                            .font(.headline)
+
+                        Spacer()
+
+                        // Clear all button
+                        Button {
+                            debugLog("Clear All tapped")
+                            removeAllNonUploading()
+                        } label: {
+                            Label("Clear All", systemImage: "trash")
+                                .labelStyle(.iconOnly) // show a clear trash icon
+                                .foregroundStyle(.red)
+                        }
+                        .help("Remove all files that are not currently uploading")
+                        .buttonStyle(.plain)
+                        .disabled(!hasRemovableItems || currentTask != nil)
+                    }
 
                     ForEach($uploadQueue) { $item in
                         HStack(spacing: 12) {
@@ -124,15 +149,23 @@ struct ContentView: View {
                                         .foregroundStyle(.secondary)
                                 case .uploading:
                                     if let p = item.progress {
-                                        ProgressView(value: p)
-                                            .frame(width: 160)
+                                        HStack(spacing: 8) {
+                                            ProgressView(value: p)
+                                                .frame(width: 160)
+                                            Text(String(format: "%.0f%%", p * 100))
+                                                .font(.caption2)
+                                                .monospacedDigit()
+                                                .foregroundStyle(.secondary)
+                                        }
                                     } else {
                                         ProgressView()
                                             .frame(width: 160)
                                     }
-                                    Text(item.elapsedText)
+                                    // Force view to re-render elapsedText every tick while uploading
+                                    Text(item.elapsedText + " ")
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
+                                        .id(elapsedTick) // changes every 0.5s
                                 case .completed:
                                     Image(systemName: "checkmark.circle.fill")
                                         .foregroundStyle(.green)
@@ -252,6 +285,22 @@ struct ContentView: View {
         }
         .onAppear {
             debugLog("ContentView appeared")
+            // If app launched via files, process them once
+            if !router.incomingFileURLs.isEmpty {
+                addSelectedFiles(router.incomingFileURLs)
+                router.incomingFileURLs = []
+            }
+        }
+        .onReceive(elapsedTimer) { _ in
+            if currentUploadingItem() != nil {
+                elapsedTick &+= 1
+            }
+        }
+        .onChange(of: router.incomingFileURLs) { newValue in
+            guard !newValue.isEmpty else { return }
+            debugLog("Received incomingFileURLs change: \(newValue.map { $0.lastPathComponent })")
+            addSelectedFiles(newValue)
+            router.incomingFileURLs = []
         }
         .onChange(of: s3Path) { _, _ in
             // Do not auto-start anymore; user controls via bottom button
@@ -347,6 +396,31 @@ struct ContentView: View {
         // Only allow removal if not uploading
         guard !isUploading(item) else { return }
         uploadQueue.removeAll { $0.id == item.id }
+    }
+
+    private func removeAllNonUploading() {
+        // Remove everything except the one currently uploading
+        let beforeCount = uploadQueue.count
+        uploadQueue.removeAll { item in
+            switch item.state {
+            case .uploading:
+                return false
+            default:
+                return true
+            }
+        }
+        debugLog("removeAllNonUploading removed \(beforeCount - uploadQueue.count) items")
+    }
+
+    private var hasRemovableItems: Bool {
+        uploadQueue.contains { item in
+            switch item.state {
+            case .uploading:
+                return false
+            default:
+                return true
+            }
+        }
     }
 
     private func isUploading(_ item: UploadItem) -> Bool {
@@ -507,7 +581,8 @@ struct ContentView: View {
             if uploadQueue.indices.contains(index) {
                 uploadQueue[index].state = .uploading
                 uploadQueue[index].startTime = Date()
-                uploadQueue[index].progress = nil
+                uploadQueue[index].endTime = nil
+                uploadQueue[index].progress = 0
             }
         }
 
@@ -521,8 +596,24 @@ struct ContentView: View {
             // Determine if file is a video
             let isVideo = isVideoFile(url)
 
-            // Upload main file: Deep Archive for all non-thumbnails
-            try await s3Service.uploadFile(localPath: url, bucket: bucket, key: key, storageClass: .deepArchive)
+            // Upload main file with progress: Deep Archive for all non-thumbnails
+            try await s3Service.uploadFile(
+                localPath: url,
+                bucket: bucket,
+                key: key,
+                storageClass: .deepArchive,
+                progress: { sent, total in
+                    Task { @MainActor in
+                        if uploadQueue.indices.contains(index) {
+                            if total > 0 {
+                                uploadQueue[index].progress = Double(sent) / Double(total)
+                            } else {
+                                uploadQueue[index].progress = nil
+                            }
+                        }
+                    }
+                }
+            )
             await MainActor.run {
                 outputText += "✅ Upload complete: s3://\(bucket)/\(key)\n"
             }
@@ -532,7 +623,9 @@ struct ContentView: View {
                 do {
                     let thumbURL = try await generateThumbnail(for: url)
                     let thumbKey = thumbnailKey(for: key)
-                    try await s3Service.uploadFile(localPath: thumbURL, bucket: bucket, key: thumbKey, storageClass: .standard)
+                    try await s3Service.uploadFile(localPath: thumbURL, bucket: bucket, key: thumbKey, storageClass: .standard, progress: { sent, total in
+                        // Optional: could surface a secondary progress, but we keep the main file's progress in the list
+                    })
                     await MainActor.run {
                         outputText += "✅ Thumbnail uploaded: s3://\(bucket)/\(thumbKey)\n"
                     }

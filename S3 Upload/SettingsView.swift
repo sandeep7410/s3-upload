@@ -23,6 +23,12 @@ struct SettingsView: View {
                     .disabled(!settings.useCustomCredentials)
             }
 
+            Section(header: Text("S3 Defaults")) {
+                TextField("Default bucket name", text: $settings.bucketName)
+                    .textFieldStyle(.roundedBorder)
+                    .help("Bucket S3Browser will use for browsing and selection.")
+            }
+
             if !validationMessage.isEmpty {
                 Text(validationMessage)
                     .foregroundStyle(.red)
@@ -50,8 +56,9 @@ struct SettingsView: View {
             validationMessage = "Please fill Access Key ID, Secret Access Key, and Region, and enable the toggle."
             return
         }
-        // Try a simple listBuckets call using a temporary S3Service instance.
+        // Use a temporary S3Service and explicitly invalidate before testing.
         let service = S3Service()
+        service.invalidateClient() // force rebuild using current settings
         do {
             _ = try await service.listBuckets()
             validationMessage = "Success: Able to list buckets."

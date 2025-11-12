@@ -9,6 +9,7 @@ final class AWSSettings: ObservableObject {
         static let accessKeyId = "AWSSettings.accessKeyId"
         static let secretAccessKey = "AWSSettings.secretAccessKey"
         static let region = "AWSSettings.region"
+        static let bucketName = "AWSSettings.bucketName"
     }
 
     @Published var useCustomCredentials: Bool {
@@ -27,12 +28,17 @@ final class AWSSettings: ObservableObject {
         didSet { UserDefaults.standard.set(region, forKey: Keys.region) }
     }
 
+    @Published var bucketName: String {
+        didSet { UserDefaults.standard.set(bucketName, forKey: Keys.bucketName) }
+    }
+
     private init() {
         let defaults = UserDefaults.standard
         self.useCustomCredentials = defaults.object(forKey: Keys.useCustomCredentials) as? Bool ?? false
         self.accessKeyId = defaults.string(forKey: Keys.accessKeyId) ?? ""
         self.secretAccessKey = defaults.string(forKey: Keys.secretAccessKey) ?? ""
         self.region = defaults.string(forKey: Keys.region) ?? "us-east-1"
+        self.bucketName = defaults.string(forKey: Keys.bucketName) ?? ""
     }
 
     var hasRequiredFields: Bool {

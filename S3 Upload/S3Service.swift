@@ -5,6 +5,7 @@ import Smithy
 import AWSSDKIdentity
 import SmithyIdentity
 import Combine
+internal import ClientRuntime
 
 private func debugLog(_ message: String, file: String = #fileID, function: String = #function, line: Int = #line) {
     print("🪵 [\(file):\(line)] \(function) — \(message)")
@@ -17,23 +18,8 @@ final class S3Service {
 
     init() {
         debugLog("S3Service init (no immediate credential requirement)")
-
-        // Observe settings changes and invalidate client automatically so that
-        // next API call rebuilds the client with latest credentials/region.
-        let settings = AWSSettings.shared
-
-        // Merge changes from each @Published property into a single stream of Void
-        let useCustom = settings.$useCustomCredentials.map { _ in () }.eraseToAnyPublisher()
-        let accessKey = settings.$accessKeyId.map { _ in () }.eraseToAnyPublisher()
-        let secretKey = settings.$secretAccessKey.map { _ in () }.eraseToAnyPublisher()
-        let region = settings.$region.map { _ in () }.eraseToAnyPublisher()
-
-        settingsCancellable = Publishers.MergeMany([useCustom, accessKey, secretKey, region])
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] in
-                debugLog("AWSSettings changed -> invalidating S3 client")
-                self?.invalidateClient()
-            }
+        // Removed automatic invalidation on settings changes.
+        // Caller will explicitly invoke invalidateClient() when appropriate (e.g., just before test connection).
     }
 
     deinit {
@@ -85,7 +71,7 @@ final class S3Service {
         }
     }
 
-    // Call this if settings change to force a rebuild on next call.
+    // Call this to force a rebuild on next call.
     func invalidateClient() {
         debugLog("invalidateClient: clearing S3 client")
         s3Client = nil
@@ -192,22 +178,39 @@ final class S3Service {
 
     // MARK: - Upload Operations
 
+    // Progress-enabled upload. The progress closure receives (bytesSent, totalBytes)
     func uploadFile(
         localPath: URL,
         bucket: String,
         key: String,
-        storageClass: S3StorageClass = .standard
+        storageClass: S3StorageClass = .standard,
+        progress: ((_ sent: Int64, _ total: Int64) -> Void)? = nil
     ) async throws {
         let client = try ensureClientReady()
-        debugLog("uploadFile start. local='\(localPath.path)', bucket='\(bucket)', key='\(key)', storageClass=\(storageClass.rawValue)")
-        let fileData = try Data(contentsOf: localPath)
-        let contentType = getContentType(for: localPath)
-        debugLog("uploadFile read data. size=\(fileData.count) bytes, contentType='\(contentType)'")
+        let fm = FileManager.default
+        let attrs = try fm.attributesOfItem(atPath: localPath.path)
+        let total = (attrs[.size] as? NSNumber)?.int64Value ?? 0
 
+        debugLog("uploadFile start. local='\(localPath.path)', bucket='\(bucket)', key='\(key)', storageClass=\(storageClass.rawValue), size=\(total)")
+
+        // Without a public Stream initializer, use a file-backed ByteStream.
+        // This avoids constructing 'any Stream' and works across SDK versions.
+        let contentType = getContentType(for: localPath)
         let awsStorageClass = mapStorageClass(storageClass)
 
+        // Notify start (0 progress), then final completion after putObject succeeds.
+        progress?(0, total)
+
+        // Open a FileHandle and use the supported initializer
+        let fh = try FileHandle(forReadingFrom: localPath)
+        defer {
+            do { try fh.close() } catch {
+                debugLog("Warning: failed to close FileHandle: \(error.localizedDescription)")
+            }
+        }
+
         var input = PutObjectInput(
-            body: .data(fileData),
+            body: .from(fileHandle: fh),
             bucket: bucket,
             key: key
         )
@@ -217,6 +220,7 @@ final class S3Service {
         }
 
         _ = try await client.putObject(input: input)
+        progress?(total, total)
         debugLog("uploadFile success: s3://\(bucket)/\(key)")
     }
 

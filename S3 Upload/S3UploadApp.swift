@@ -6,12 +6,15 @@ private func debugLog(_ message: String, file: String = #fileID, function: Strin
 
 @main
 struct S3UploadApp: App {
+    @StateObject private var openFilesRouter = OpenFilesRouter()
+
     init() {
         debugLog("App init")
     }
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(openFilesRouter)
                 .onAppear {
                     debugLog("WindowGroup ContentView onAppear")
                 }
