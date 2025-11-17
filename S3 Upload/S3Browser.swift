@@ -28,8 +28,11 @@ struct S3Browser: View {
     @State private var errorMessage: String? = nil
     @State private var pathHistory: [String] = []
     @State private var keyHistory: [String] = []
-    
+    @State private var showNewFolderPrompt: Bool = false
+    @State private var newFolderName: String = ""
+
     private let s3Lister = S3Lister()
+    private let s3Service = S3Service()
     
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -71,6 +74,15 @@ struct S3Browser: View {
                     .font(.subheadline)
                 }
                 .disabled(currentPrefix.isEmpty || settings.bucketName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Button {
+                    showNewFolderPrompt = true
+                    newFolderName = ""
+                } label: {
+                    Label("New Folder", systemImage: "folder.badge.plus")
+                }
+                .font(.subheadline)
+                .disabled(settings.bucketName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 Spacer()
 
@@ -163,7 +175,7 @@ struct S3Browser: View {
                     }
                 }
             }
-            .frame(maxHeight: 200) // keep internal height; external container can override
+            .frame(maxHeight: 200)
             .border(Color.gray.opacity(0.3), width: 1)
             .cornerRadius(4)
         }
@@ -172,8 +184,14 @@ struct S3Browser: View {
             loadRoot()
         }
         .onChange(of: settings.bucketName) { _, _ in
-            // When bucket changes, reset navigation and reload
             loadRoot()
+        }
+        .alert("New Folder", isPresented: $showNewFolderPrompt) {
+            TextField("Folder name", text: $newFolderName)
+            Button("Create") { Task { await createNewFolder() } }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Enter a folder name to create under the current path.")
         }
     }
     
@@ -203,7 +221,6 @@ struct S3Browser: View {
     private func navigateToFolder(_ item: S3Item) {
         guard item.isFolder else { return }
         debugLog("navigateToFolder -> key='\(item.key)'")
-        // Push history to enable back/breadcrumbs in future
         pathHistory.append(item.name)
         keyHistory.append(item.key)
         currentPrefix = item.key
@@ -250,9 +267,40 @@ struct S3Browser: View {
         }
     }
     
+    // MARK: - New Folder
+
+    @MainActor
+    private func createNewFolder() async {
+        let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        let bucket = settings.bucketName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bucket.isEmpty else { return }
+
+        // Construct new folder key under currentPrefix
+        var newKey = currentPrefix
+        newKey += name
+        if !newKey.hasSuffix("/") { newKey += "/" }
+
+        // Optional: check existence
+        if items.contains(where: { $0.isFolder && $0.key == newKey }) {
+            errorMessage = "Folder already exists."
+            return
+        }
+
+        do {
+            let createdKey = try await s3Service.createFolder(bucket: bucket, key: newKey)
+            // Navigate into it and select it
+            currentPrefix = createdKey
+            load(prefix: createdKey)
+            selectedPath = normalizedPath(forFolderKey: createdKey)
+            debugLog("Created and selected folder '\(createdKey)'")
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+    
     // MARK: - Selection
     
-    // Normalizes "bucket/key" with a trailing slash for folders
     private func normalizedPath(forFolderKey key: String) -> String {
         let bucket = settings.bucketName.trimmingCharacters(in: .whitespacesAndNewlines)
         if key.hasSuffix("/") {

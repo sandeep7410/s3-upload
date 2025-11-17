@@ -178,7 +178,7 @@ final class S3Service {
 
     // MARK: - Upload Operations
 
-    // Progress-enabled upload. The progress closure receives (bytesSent, totalBytes)
+    // Progress-enabled upload. Uses single-part for <= 8 MiB, multipart for larger files.
     func uploadFile(
         localPath: URL,
         bucket: String,
@@ -193,35 +193,152 @@ final class S3Service {
 
         debugLog("uploadFile start. local='\(localPath.path)', bucket='\(bucket)', key='\(key)', storageClass=\(storageClass.rawValue), size=\(total)")
 
-        // Without a public Stream initializer, use a file-backed ByteStream.
-        // This avoids constructing 'any Stream' and works across SDK versions.
         let contentType = getContentType(for: localPath)
         let awsStorageClass = mapStorageClass(storageClass)
 
-        // Notify start (0 progress), then final completion after putObject succeeds.
+        let partSize = 8 * 1024 * 1024 // 8 MiB
+
+        if total <= partSize {
+            // Single-part upload
+            var bodyData = try Data(contentsOf: localPath, options: .mappedIfSafe)
+            var input = PutObjectInput(
+                body: .data(bodyData),
+                bucket: bucket,
+                key: key
+            )
+            input.contentLength = Int(total) // Int (fixes NSNumber/Int mismatch)
+            input.contentType = contentType
+            if let storageClass = awsStorageClass {
+                input.storageClass = storageClass
+            }
+
+            progress?(0, total)
+            _ = try await client.putObject(input: input)
+            progress?(total, total)
+            debugLog("uploadFile success (single-part): s3://\(bucket)/\(key)")
+            bodyData.removeAll(keepingCapacity: false)
+            return
+        }
+
+        // Multipart upload
         progress?(0, total)
 
-        // Open a FileHandle and use the supported initializer
-        let fh = try FileHandle(forReadingFrom: localPath)
+        // 1) Initiate multipart upload
+        var createInput = CreateMultipartUploadInput(
+            bucket: bucket,
+            key: key
+        )
+        createInput.contentType = contentType
+        if let storageClass = awsStorageClass {
+            createInput.storageClass = storageClass
+        }
+
+        let createOutput = try await client.createMultipartUpload(input: createInput)
+        guard let uploadId = createOutput.uploadId else {
+            debugLog("createMultipartUpload returned nil uploadId")
+            throw S3Error.requestFailed
+        }
+        debugLog("createMultipartUpload success. uploadId=\(uploadId)")
+
+        // 2) Read file and upload parts
+        let handle = try FileHandle(forReadingFrom: localPath)
         defer {
-            do { try fh.close() } catch {
+            do { try handle.close() } catch {
                 debugLog("Warning: failed to close FileHandle: \(error.localizedDescription)")
             }
         }
 
-        var input = PutObjectInput(
-            body: .from(fileHandle: fh),
-            bucket: bucket,
-            key: key
-        )
-        input.contentType = contentType
-        if let storageClass = awsStorageClass {
-            input.storageClass = storageClass
+        var bytesSent: Int64 = 0
+        var partNumber = 0
+        var completedParts: [S3ClientTypes.CompletedPart] = []
+
+        do {
+            while true {
+                try Task.checkCancellation()
+
+                let chunk = try handle.read(upToCount: partSize) ?? Data()
+                if chunk.isEmpty {
+                    break
+                }
+                partNumber += 1
+
+                var uploadPartInput = UploadPartInput()
+                uploadPartInput.bucket = bucket
+                uploadPartInput.key = key
+                uploadPartInput.uploadId = uploadId
+                uploadPartInput.partNumber = partNumber
+                uploadPartInput.contentLength = chunk.count
+                uploadPartInput.body = .data(chunk)
+
+                debugLog("Uploading part #\(partNumber), size=\(chunk.count)")
+                let partOutput = try await client.uploadPart(input: uploadPartInput)
+                guard let etag = partOutput.eTag else {
+                    debugLog("uploadPart returned nil ETag for part \(partNumber)")
+                    throw S3Error.requestFailed
+                }
+
+                let completed = S3ClientTypes.CompletedPart(eTag: etag, partNumber: partNumber)
+                completedParts.append(completed)
+
+                bytesSent += Int64(chunk.count)
+                progress?(bytesSent, total)
+            }
+
+            // 3) Complete multipart upload
+            let completedUpload = S3ClientTypes.CompletedMultipartUpload(parts: completedParts)
+            var completeInput = CompleteMultipartUploadInput(
+                bucket: bucket,
+                key: key,
+                multipartUpload: completedUpload,
+                uploadId: uploadId
+            )
+            completeInput.mpuObjectSize = Int(total)
+
+            let completeOutput = try await client.completeMultipartUpload(input: completeInput)
+            debugLog("completeMultipartUpload success. eTag=\(completeOutput.eTag ?? "nil")")
+            progress?(total, total)
+            debugLog("uploadFile success (multipart): s3://\(bucket)/\(key)")
+        } catch {
+            // 4) Abort on failure or cancellation
+            debugLog("multipart upload failed or cancelled: \(error.localizedDescription). Aborting uploadId=\(uploadId)")
+            do {
+                let abortInput = AbortMultipartUploadInput(
+                    bucket: bucket,
+                    key: key,
+                    uploadId: uploadId
+                )
+                _ = try await client.abortMultipartUpload(input: abortInput)
+                debugLog("abortMultipartUpload success")
+            } catch {
+                debugLog("abortMultipartUpload failed: \(error.localizedDescription)")
+            }
+            throw error
         }
+    }
+
+    // MARK: - Folder Operations
+
+    // Creates a "folder" by putting a zero-byte object whose key ends with "/".
+    // Returns the normalized folder key (ensures trailing slash).
+    func createFolder(bucket: String, key: String) async throws -> String {
+        let client = try ensureClientReady()
+        var folderKey = key
+        if !folderKey.hasSuffix("/") {
+            folderKey += "/"
+        }
+        debugLog("createFolder start. bucket='\(bucket)', key='\(folderKey)'")
+
+        var input = PutObjectInput(
+            body: .data(Data()), // zero-byte
+            bucket: bucket,
+            key: folderKey
+        )
+        input.contentLength = 0
+        input.contentType = "application/x-directory"
 
         _ = try await client.putObject(input: input)
-        progress?(total, total)
-        debugLog("uploadFile success: s3://\(bucket)/\(key)")
+        debugLog("createFolder success: s3://\(bucket)/\(folderKey)")
+        return folderKey
     }
 
     // MARK: - Helper Methods
@@ -254,7 +371,8 @@ final class S3Service {
             "gif": "image/gif",
             "pdf": "application/pdf",
             "txt": "text/plain",
-            "json": "application/json"
+            "json": "application/json",
+            "webp": "image/webp"
         ]
         let type = contentTypes[pathExtension] ?? "application/octet-stream"
         debugLog("getContentType: ext='\(pathExtension)' -> '\(type)'")

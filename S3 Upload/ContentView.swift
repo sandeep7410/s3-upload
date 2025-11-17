@@ -2,9 +2,36 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AVFoundation
 import Combine
+import AVFoundation
+import CoreGraphics
 
 private func debugLog(_ message: String, file: String = #fileID, function: String = #function, line: Int = #line) {
     print("🪵 [\(file):\(line)] \(function) — \(message)")
+}
+
+
+/// Returns the video size after applying track preferredTransform (i.e. the correct width/height).
+func correctedVideoSize(for asset: AVAsset) async -> CGSize? {
+    do {
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        guard let track = tracks.first else { return nil }
+        let size = try await track.load(.naturalSize)
+        let t = try await track.load(.preferredTransform)
+
+        // Apply transform to the four corners of the rect to get the bounding box
+        let rect = CGRect(origin: .zero, size: size)
+        let transformedRect = rect.applying(t)
+        // boundingBox might have negative origin; use absolute width/height
+        return CGSize(width: abs(transformedRect.width), height: abs(transformedRect.height))
+    } catch {
+        return nil
+    }
+}
+
+/// True if the video is portrait (vertical). Returns nil when size can't be determined.
+func isVideoPortrait(_ asset: AVAsset) async -> Bool? {
+    guard let sz = await correctedVideoSize(for: asset) else { return nil }
+    return sz.height > sz.width
 }
 
 struct UploadItem: Identifiable, Equatable {
@@ -23,6 +50,13 @@ struct UploadItem: Identifiable, Equatable {
     var startTime: Date? = nil
     var endTime: Date? = nil
 
+    // New: bytes tracking for speed/ETA
+    var totalBytes: Int64? = nil
+    var bytesSent: Int64? = nil
+    // Transient display fields (updated by UI)
+    var speedText: String? = nil
+    var etaText: String? = nil
+
     var elapsedText: String {
         let end = endTime ?? Date()
         guard let start = startTime else { return "" }
@@ -31,12 +65,19 @@ struct UploadItem: Identifiable, Equatable {
     }
 
     static func formatInterval(_ interval: TimeInterval) -> String {
+        if interval.isNaN || interval.isInfinite || interval < 0 {
+            return "--"
+        }
         if interval < 60 {
             return String(format: "%.1fs", interval)
-        } else {
+        } else if interval < 3600 {
             let minutes = Int(interval) / 60
             let seconds = Int(interval) % 60
             return String(format: "%dm %02ds", minutes, seconds)
+        } else {
+            let hours = Int(interval) / 3600
+            let minutes = (Int(interval) % 3600) / 60
+            return String(format: "%dh %02dm", hours, minutes)
         }
     }
 }
@@ -68,6 +109,22 @@ struct ContentView: View {
     // Timer to refresh elapsed time while uploading
     @State private var elapsedTick: Int = 0
     private let elapsedTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+
+    // New: short history for speed smoothing per uploading item
+    struct SpeedSample {
+        let time: CFAbsoluteTime
+        let bytes: Int64
+    }
+    @State private var speedHistory: [UUID: [SpeedSample]] = [:] // keyed by UploadItem.id
+
+    // Stability additions: keep last valid values and timestamps
+    @State private var lastValidSpeedText: [UUID: String] = [:]
+    @State private var lastValidETAText: [UUID: String] = [:]
+    @State private var lastValidSpeedTime: [UUID: CFAbsoluteTime] = [:]
+
+    // Tunables for stability
+    private let smoothingWindowSeconds: CFAbsoluteTime = 3.0
+    private let graceTimeoutSeconds: CFAbsoluteTime = 8.0
 
     var body: some View {
         VStack(spacing: 16) {
@@ -101,7 +158,7 @@ struct ContentView: View {
                             removeAllNonUploading()
                         } label: {
                             Label("Clear All", systemImage: "trash")
-                                .labelStyle(.iconOnly) // show a clear trash icon
+                                .labelStyle(.iconOnly)
                                 .foregroundStyle(.red)
                         }
                         .help("Remove all files that are not currently uploading")
@@ -130,7 +187,7 @@ struct ContentView: View {
                                         .foregroundStyle(.secondary)
                                 }
                                 .help("Remove from list")
-                                .disabled(isRunning) // prevent removing while running sequence
+                                .disabled(isRunning)
                             }
 
                             // File name
@@ -140,7 +197,7 @@ struct ContentView: View {
 
                             Spacer()
 
-                            // Progress and elapsed time
+                            // Progress, speed, ETA, elapsed
                             Group {
                                 switch item.state {
                                 case .queued:
@@ -161,11 +218,30 @@ struct ContentView: View {
                                         ProgressView()
                                             .frame(width: 160)
                                     }
+
+                                    VStack(alignment: .trailing, spacing: 2) {
+                                        // Speed
+                                        if let speed = item.speedText {
+                                            Text(speed)
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                                .monospacedDigit()
+                                        }
+                                        // ETA
+                                        if let eta = item.etaText {
+                                            Text("ETA: \(eta)")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                                .monospacedDigit()
+                                        }
+                                    }
+                                    .frame(minWidth: 120, alignment: .trailing)
+
                                     // Force view to re-render elapsedText every tick while uploading
                                     Text(item.elapsedText + " ")
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
-                                        .id(elapsedTick) // changes every 0.5s
+                                        .id(elapsedTick)
                                 case .completed:
                                     Image(systemName: "checkmark.circle.fill")
                                         .foregroundStyle(.green)
@@ -368,7 +444,6 @@ struct ContentView: View {
     }
 
     private var shouldShowResetButton: Bool {
-        // Show reset when there are no eligible items left and not currently uploading
         let anyEligible = uploadQueue.contains { item in
             switch item.state {
             case .queued, .failed, .cancelled:
@@ -386,21 +461,23 @@ struct ContentView: View {
         debugLog("addSelectedFiles: \(urls.map { $0.lastPathComponent })")
         runError = nil
         let newItems = urls.map { UploadItem(url: $0) }
-        // Avoid duplicates by URL
         let existingURLs = Set(uploadQueue.map { $0.url })
         let filtered = newItems.filter { !existingURLs.contains($0.url) }
         uploadQueue.append(contentsOf: filtered)
     }
 
     private func removeItem(_ item: UploadItem) {
-        // Only allow removal if not uploading
         guard !isUploading(item) else { return }
         uploadQueue.removeAll { $0.id == item.id }
+        speedHistory[item.id] = nil
+        lastValidSpeedText[item.id] = nil
+        lastValidETAText[item.id] = nil
+        lastValidSpeedTime[item.id] = nil
     }
 
     private func removeAllNonUploading() {
-        // Remove everything except the one currently uploading
         let beforeCount = uploadQueue.count
+        let uploadingId = currentUploadingItem()?.id
         uploadQueue.removeAll { item in
             switch item.state {
             case .uploading:
@@ -408,6 +485,12 @@ struct ContentView: View {
             default:
                 return true
             }
+        }
+        if let uploadingId {
+            speedHistory = speedHistory.filter { $0.key == uploadingId }
+            lastValidSpeedText = lastValidSpeedText.filter { $0.key == uploadingId }
+            lastValidETAText = lastValidETAText.filter { $0.key == uploadingId }
+            lastValidSpeedTime = lastValidSpeedTime.filter { $0.key == uploadingId }
         }
         debugLog("removeAllNonUploading removed \(beforeCount - uploadQueue.count) items")
     }
@@ -443,7 +526,6 @@ struct ContentView: View {
     }
 
     private func attemptStartNextIfNeeded() {
-        // Retained for potential manual single-start behavior; now unused by the Upload button.
         guard hasValidS3Path else {
             debugLog("attemptStartNextIfNeeded: no valid s3Path")
             runError = "Please select an S3 destination."
@@ -466,17 +548,23 @@ struct ContentView: View {
             debugLog("attemptStartNextIfNeeded: no eligible items")
             return
         }
-        // Reset failed/cancelled back to queued when starting again
         switch uploadQueue[nextIndex].state {
         case .failed, .cancelled:
             uploadQueue[nextIndex].state = .queued
             uploadQueue[nextIndex].startTime = nil
             uploadQueue[nextIndex].endTime = nil
             uploadQueue[nextIndex].progress = nil
+            uploadQueue[nextIndex].bytesSent = nil
+            uploadQueue[nextIndex].totalBytes = nil
+            uploadQueue[nextIndex].speedText = nil
+            uploadQueue[nextIndex].etaText = nil
+            speedHistory[uploadQueue[nextIndex].id] = []
+            lastValidSpeedText[uploadQueue[nextIndex].id] = nil
+            lastValidETAText[uploadQueue[nextIndex].id] = nil
+            lastValidSpeedTime[uploadQueue[nextIndex].id] = nil
         default:
             break
         }
-        // Start just one (legacy)
         Task { await startSingleUpload(at: nextIndex) }
     }
 
@@ -486,10 +574,11 @@ struct ContentView: View {
 
     private func cancelCurrentUpload() {
         currentTask?.cancel()
-        // Mark the uploading item as cancelled; sequence will stop
         if let idx = uploadQueue.firstIndex(where: { $0.state == .uploading }) {
             uploadQueue[idx].state = .cancelled
             uploadQueue[idx].endTime = Date()
+            uploadQueue[idx].speedText = nil
+            uploadQueue[idx].etaText = nil
         }
         isRunning = false
         uploadProgress = nil
@@ -501,9 +590,12 @@ struct ContentView: View {
         runError = nil
         outputText = "Drop files to upload to S3."
         isOutputExpanded = false
+        speedHistory.removeAll()
+        lastValidSpeedText.removeAll()
+        lastValidETAText.removeAll()
+        lastValidSpeedTime.removeAll()
     }
 
-    // New: run all eligible items sequentially
     private func startSequentialUploads() {
         guard hasValidS3Path else {
             runError = "Please select an S3 destination."
@@ -526,9 +618,7 @@ struct ContentView: View {
                 }
             }
 
-            // Loop over items until none left or cancelled
             while !Task.isCancelled {
-                // Find next eligible item (only queued in this run)
                 guard let nextIndex = await MainActor.run(body: { () -> Int? in
                     uploadQueue.firstIndex(where: { item in
                         if case .queued = item.state { return true }
@@ -539,10 +629,8 @@ struct ContentView: View {
                     break
                 }
 
-                // Upload this item and await completion
                 await startSingleUpload(at: nextIndex)
 
-                // If cancelled during upload, stop the sequence
                 if Task.isCancelled {
                     debugLog("Sequential: task cancelled; stopping sequence")
                     break
@@ -551,7 +639,6 @@ struct ContentView: View {
         }
     }
 
-    // Refactored: upload a single item at index and await completion
     private func startSingleUpload(at index: Int) async {
         guard await MainActor.run(body: { uploadQueue.indices.contains(index) }) else { return }
         guard hasValidS3Path else {
@@ -559,7 +646,6 @@ struct ContentView: View {
             return
         }
 
-        // Snapshot the item and URL
         let item = await MainActor.run { uploadQueue[index] }
         let url = item.url
 
@@ -572,43 +658,100 @@ struct ContentView: View {
             }
         }
 
-        // Security scope
         let securityScoped = url.startAccessingSecurityScopedResource()
         debugLog("Security scoped access started=\(securityScoped) for \(url.path)")
 
-        // Mark uploading
         await MainActor.run {
             if uploadQueue.indices.contains(index) {
                 uploadQueue[index].state = .uploading
                 uploadQueue[index].startTime = Date()
                 uploadQueue[index].endTime = nil
                 uploadQueue[index].progress = 0
+                uploadQueue[index].bytesSent = 0
+                // set totalBytes for UI speed/ETA
+                if let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber {
+                    uploadQueue[index].totalBytes = size.int64Value
+                }
+                speedHistory[uploadQueue[index].id] = []
+                lastValidSpeedText[uploadQueue[index].id] = nil
+                lastValidETAText[uploadQueue[index].id] = nil
+                lastValidSpeedTime[uploadQueue[index].id] = nil
             }
         }
 
-        // Perform the upload with storage class selection and optional thumbnail
         do {
             try Task.checkCancellation()
-
-            // Compute bucket and key from s3Path
             let (bucket, key) = try parseS3Path(s3Path: s3Path, fileURL: url)
-
-            // Determine if file is a video
             let isVideo = isVideoFile(url)
 
-            // Upload main file with progress: Deep Archive for all non-thumbnails
             try await s3Service.uploadFile(
                 localPath: url,
                 bucket: bucket,
                 key: key,
                 storageClass: .deepArchive,
                 progress: { sent, total in
+                    let now = CFAbsoluteTimeGetCurrent()
                     Task { @MainActor in
-                        if uploadQueue.indices.contains(index) {
-                            if total > 0 {
-                                uploadQueue[index].progress = Double(sent) / Double(total)
+                        guard uploadQueue.indices.contains(index) else { return }
+                        uploadQueue[index].bytesSent = sent
+                        uploadQueue[index].totalBytes = total
+                        if total > 0 {
+                            uploadQueue[index].progress = Double(sent) / Double(total)
+                        } else {
+                            uploadQueue[index].progress = nil
+                        }
+
+                        let id = uploadQueue[index].id
+                        var history = speedHistory[id] ?? []
+
+                        // Enforce monotonic bytes; drop sample if it goes backwards
+                        if let last = history.last, sent < last.bytes {
+                            // keep displaying current values; do not clear
+                            // but still trim old samples below
+                        } else {
+                            history.append(SpeedSample(time: now, bytes: sent))
+                        }
+
+                        // Keep last smoothingWindowSeconds of samples
+                        history = history.filter { now - $0.time <= smoothingWindowSeconds }
+                        speedHistory[id] = history
+
+                        var updatedSpeedText: String? = nil
+                        var updatedETAText: String? = nil
+                        var hasValidComputation = false
+
+                        if let first = history.first, let last = history.last, last.time > first.time, last.bytes >= first.bytes {
+                            let dt = last.time - first.time
+                            let db = last.bytes - first.bytes
+                            let bps = dt > 0 ? Double(db) / dt : 0
+                            // Convert to text
+                            updatedSpeedText = formatSpeed(max(bps, 0))
+                            if total > 0 && bps > 1 {
+                                let remaining = Double(total - sent)
+                                let eta = remaining / bps
+                                updatedETAText = UploadItem.formatInterval(eta)
                             } else {
-                                uploadQueue[index].progress = nil
+                                updatedETAText = "--"
+                            }
+                            hasValidComputation = true
+                        }
+
+                        if hasValidComputation {
+                            uploadQueue[index].speedText = updatedSpeedText
+                            uploadQueue[index].etaText = updatedETAText
+                            lastValidSpeedText[id] = updatedSpeedText
+                            lastValidETAText[id] = updatedETAText
+                            lastValidSpeedTime[id] = now
+                        } else {
+                            // No valid window now: use last known good within grace period
+                            let lastTime = lastValidSpeedTime[id] ?? 0
+                            if now - lastTime <= graceTimeoutSeconds, let lastSpeed = lastValidSpeedText[id], let lastETA = lastValidETAText[id] {
+                                uploadQueue[index].speedText = lastSpeed
+                                uploadQueue[index].etaText = lastETA
+                            } else {
+                                // Grace expired or none recorded: show minimal fallback, not nil
+                                uploadQueue[index].speedText = "0 B/s"
+                                uploadQueue[index].etaText = "--"
                             }
                         }
                     }
@@ -618,19 +761,15 @@ struct ContentView: View {
                 outputText += "✅ Upload complete: s3://\(bucket)/\(key)\n"
             }
 
-            // If video, generate thumbnail (4x4 timeframe) and upload to Standard
             if isVideo {
                 do {
                     let thumbURL = try await generateThumbnail(for: url)
                     let thumbKey = thumbnailKey(for: key)
-                    try await s3Service.uploadFile(localPath: thumbURL, bucket: bucket, key: thumbKey, storageClass: .standard, progress: { sent, total in
-                        // Optional: could surface a secondary progress, but we keep the main file's progress in the list
-                    })
+                    try await s3Service.uploadFile(localPath: thumbURL, bucket: bucket, key: thumbKey, storageClass: .standard, progress: { _, _ in })
                     await MainActor.run {
                         outputText += "✅ Thumbnail uploaded: s3://\(bucket)/\(thumbKey)\n"
                     }
                 } catch {
-                    // Thumbnail failed — mark item failed and continue to next file
                     await MainActor.run {
                         if uploadQueue.indices.contains(index) {
                             uploadQueue[index].state = .failed("Thumbnail generation/upload failed: \(error.localizedDescription)")
@@ -649,6 +788,8 @@ struct ContentView: View {
                     uploadQueue[index].state = .completed
                     uploadQueue[index].endTime = Date()
                     uploadQueue[index].progress = 1.0
+                    uploadQueue[index].speedText = nil
+                    uploadQueue[index].etaText = nil
                 }
                 outputText += "\n✅ Upload complete!"
                 runError = nil
@@ -658,19 +799,20 @@ struct ContentView: View {
                 if uploadQueue.indices.contains(index) {
                     uploadQueue[index].state = .cancelled
                     uploadQueue[index].endTime = Date()
+                    uploadQueue[index].speedText = nil
+                    uploadQueue[index].etaText = nil
                 }
             }
         } catch {
-            // Any error (including thumbnail) marks the item as failed; do not retry in this run
             await MainActor.run {
                 if uploadQueue.indices.contains(index) {
-                    // If not already set as failed by thumbnail branch, set failed now
                     if case .failed = uploadQueue[index].state {
-                        // already failed
                     } else {
                         uploadQueue[index].state = .failed(error.localizedDescription)
                     }
                     uploadQueue[index].endTime = Date()
+                    uploadQueue[index].speedText = nil
+                    uploadQueue[index].etaText = nil
                 }
                 runError = error.localizedDescription
                 outputText += "\n❌ Error: \(error.localizedDescription)"
@@ -686,7 +828,6 @@ struct ContentView: View {
     // MARK: - Helpers for S3 key parsing and thumbnails
 
     private func parseS3Path(s3Path: String, fileURL: URL) throws -> (bucket: String, key: String) {
-        // Same logic as FileUploader.parseS3Path to avoid changing FileUploader
         if let slashIndex = s3Path.firstIndex(of: "/") {
             let bucket = String(s3Path[..<slashIndex])
             var key = String(s3Path[s3Path.index(after: slashIndex)...])
@@ -710,17 +851,48 @@ struct ContentView: View {
     }
 
     private func generateThumbnail(for videoURL: URL) async throws -> URL {
-        // Uses your VideoThumbnailGenerator in timeframe mode; it already generates evenly spaced frames
-        let generator = VideoThumbnailGenerator(videoURL: videoURL, rows: 4, cols: 4, thumbSize: CGSize(width: 320, height: 180))
+        let asset = AVAsset(url: videoURL)
+        let thumbsize: CGSize
+        let aspectRatio: CGFloat
+        let rows: Int
+        let cols: Int
+        if let portrait = await isVideoPortrait(asset), portrait {
+            thumbsize = CGSize(width: 180, height: 320)
+            aspectRatio = 9.0/16.0
+            rows = 3
+            cols = 3
+        } else {
+            thumbsize = CGSize(width: 320, height: 180)
+            aspectRatio = 16.0/9.0
+            rows = 4
+            cols = 4
+        }
+        let generator = VideoThumbnailGenerator(videoURL: videoURL, rows: rows, cols: cols, thumbSize: thumbsize, aspectRatio: aspectRatio)
         let url = try await generator.generateThumbnail(mode: .timeframe)
         return url
     }
 
     private func thumbnailKey(for originalKey: String) -> String {
-        // Replace extension with _thumbnail.jpg
         let ns = originalKey as NSString
         let base = ns.deletingPathExtension
-        return "\(base)_thumbnail.jpg"
+        return "\(base)_thumbnail.webp"
+    }
+
+    // Format speed as human-readable (B/s, KB/s, MB/s, GB/s)
+    private func formatSpeed(_ bytesPerSecond: Double) -> String {
+        guard bytesPerSecond.isFinite && bytesPerSecond >= 0 else { return "--" }
+        let units = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"]
+        var value = bytesPerSecond
+        var unitIndex = 0
+        while value >= 1024.0 && unitIndex < units.count - 1 {
+            value /= 1024.0
+            unitIndex += 1
+        }
+        if unitIndex == 0 {
+            return String(format: "%.0f %@", value, units[unitIndex])
+        } else {
+            return String(format: "%.2f %@", value, units[unitIndex])
+        }
     }
 }
 
