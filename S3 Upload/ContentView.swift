@@ -122,9 +122,11 @@ struct ContentView: View {
     @State private var lastValidETAText: [UUID: String] = [:]
     @State private var lastValidSpeedTime: [UUID: CFAbsoluteTime] = [:]
 
-    // Tunables for stability
-    private let smoothingWindowSeconds: CFAbsoluteTime = 3.0
-    private let graceTimeoutSeconds: CFAbsoluteTime = 8.0
+    // Tunables for stability (increased windows)
+    private let smoothingWindowSeconds: CFAbsoluteTime = 10.0
+    private let graceTimeoutSeconds: CFAbsoluteTime = 15.0
+    private let minimumDeltaTimeForCompute: CFAbsoluteTime = 1.0
+    private let maxETAHoursClamp: Double = 24.0
 
     var body: some View {
         VStack(spacing: 16) {
@@ -648,6 +650,7 @@ struct ContentView: View {
 
         let item = await MainActor.run { uploadQueue[index] }
         let url = item.url
+        let itemId = item.id
 
         await MainActor.run {
             isRunning = true
@@ -679,6 +682,116 @@ struct ContentView: View {
             }
         }
 
+        func updateUIProgress(sent: Int64, total: Int64) {
+            let now = CFAbsoluteTimeGetCurrent()
+            // Lookup by id to avoid stale index issues
+            guard let idx = uploadQueue.firstIndex(where: { $0.id == itemId }) else { return }
+            guard uploadQueue[idx].state == .uploading else { return }
+
+            // Ensure monotonic bytes (coerce backwards to last)
+            let previousSent = uploadQueue[idx].bytesSent ?? 0
+            let coercedSent = max(previousSent, sent)
+
+            uploadQueue[idx].bytesSent = coercedSent
+            uploadQueue[idx].totalBytes = total
+            if total > 0 {
+                uploadQueue[idx].progress = Double(coercedSent) / Double(total)
+            } else {
+                uploadQueue[idx].progress = nil
+            }
+
+            var history = speedHistory[itemId] ?? []
+
+            // Append new sample with coerced bytes
+            history.append(SpeedSample(time: now, bytes: coercedSent))
+
+            // Keep only samples within smoothing window and ensure non-decreasing bytes
+            history = history.filter { now - $0.time <= smoothingWindowSeconds }
+            // Compact duplicates to reduce noise (keep last for same bytes)
+            var compacted: [SpeedSample] = []
+            for s in history {
+                if let last = compacted.last, s.bytes < last.bytes {
+                    // coerce to last.bytes to keep monotonicity
+                    compacted.append(SpeedSample(time: s.time, bytes: last.bytes))
+                } else {
+                    compacted.append(s)
+                }
+            }
+            history = compacted
+            speedHistory[itemId] = history
+
+            var updatedSpeedText: String? = nil
+            var updatedETAText: String? = nil
+            var hadValidWindow = false
+
+            // Compute window-based speed if we have at least 2 samples and enough dt
+            if let first = history.first, let last = history.last {
+                let dt = last.time - first.time
+                let db = last.bytes - first.bytes
+                if dt >= minimumDeltaTimeForCompute, db >= 0 {
+                    let bps = max(Double(db) / dt, 0)
+                    updatedSpeedText = formatSpeed(bps)
+                    if total > 0, bps > 0 {
+                        let remaining = Double(total - coercedSent)
+                        var eta = remaining / bps
+                        // clamp ETA to avoid absurd values
+                        let maxEta = maxETAHoursClamp * 3600.0
+                        if eta > maxEta { eta = maxEta }
+                        updatedETAText = UploadItem.formatInterval(eta)
+                    } else {
+                        updatedETAText = "--"
+                    }
+                    hadValidWindow = true
+                }
+            }
+
+            // Fallback: since-start average if window invalid but we have progress
+            if !hadValidWindow,
+               let start = uploadQueue[idx].startTime,
+               coercedSent > 0 {
+                let dt = Date().timeIntervalSince(start)
+                if dt >= minimumDeltaTimeForCompute {
+                    let bps = max(Double(coercedSent) / dt, 0)
+                    updatedSpeedText = formatSpeed(bps)
+                    if total > 0, bps > 0 {
+                        let remaining = Double(total - coercedSent)
+                        var eta = remaining / bps
+                        let maxEta = maxETAHoursClamp * 3600.0
+                        if eta > maxEta { eta = maxEta }
+                        updatedETAText = UploadItem.formatInterval(eta)
+                    } else {
+                        updatedETAText = "--"
+                    }
+                }
+            }
+
+            if let s = updatedSpeedText, let e = updatedETAText {
+                uploadQueue[idx].speedText = s
+                uploadQueue[idx].etaText = e
+                lastValidSpeedText[itemId] = s
+                lastValidETAText[itemId] = e
+                lastValidSpeedTime[itemId] = now
+            } else {
+                // Use last valid within grace; otherwise keep current display without forcing "0 B/s"
+                let lastTime = lastValidSpeedTime[itemId] ?? 0
+                if now - lastTime <= graceTimeoutSeconds,
+                   let lastSpeed = lastValidSpeedText[itemId],
+                   let lastETA = lastValidETAText[itemId] {
+                    uploadQueue[idx].speedText = lastSpeed
+                    uploadQueue[idx].etaText = lastETA
+                } else {
+                    // Only show minimal fallback if we truly have nothing
+                    if uploadQueue[idx].bytesSent ?? 0 == 0 {
+                        uploadQueue[idx].speedText = "--"
+                        uploadQueue[idx].etaText = "--"
+                    } else {
+                        // Keep previous display if any
+                        // No update, avoids flicker to 0 B/s
+                    }
+                }
+            }
+        }
+
         do {
             try Task.checkCancellation()
             let (bucket, key) = try parseS3Path(s3Path: s3Path, fileURL: url)
@@ -690,70 +803,8 @@ struct ContentView: View {
                 key: key,
                 storageClass: .deepArchive,
                 progress: { sent, total in
-                    let now = CFAbsoluteTimeGetCurrent()
                     Task { @MainActor in
-                        guard uploadQueue.indices.contains(index) else { return }
-                        uploadQueue[index].bytesSent = sent
-                        uploadQueue[index].totalBytes = total
-                        if total > 0 {
-                            uploadQueue[index].progress = Double(sent) / Double(total)
-                        } else {
-                            uploadQueue[index].progress = nil
-                        }
-
-                        let id = uploadQueue[index].id
-                        var history = speedHistory[id] ?? []
-
-                        // Enforce monotonic bytes; drop sample if it goes backwards
-                        if let last = history.last, sent < last.bytes {
-                            // keep displaying current values; do not clear
-                            // but still trim old samples below
-                        } else {
-                            history.append(SpeedSample(time: now, bytes: sent))
-                        }
-
-                        // Keep last smoothingWindowSeconds of samples
-                        history = history.filter { now - $0.time <= smoothingWindowSeconds }
-                        speedHistory[id] = history
-
-                        var updatedSpeedText: String? = nil
-                        var updatedETAText: String? = nil
-                        var hasValidComputation = false
-
-                        if let first = history.first, let last = history.last, last.time > first.time, last.bytes >= first.bytes {
-                            let dt = last.time - first.time
-                            let db = last.bytes - first.bytes
-                            let bps = dt > 0 ? Double(db) / dt : 0
-                            // Convert to text
-                            updatedSpeedText = formatSpeed(max(bps, 0))
-                            if total > 0 && bps > 1 {
-                                let remaining = Double(total - sent)
-                                let eta = remaining / bps
-                                updatedETAText = UploadItem.formatInterval(eta)
-                            } else {
-                                updatedETAText = "--"
-                            }
-                            hasValidComputation = true
-                        }
-
-                        if hasValidComputation {
-                            uploadQueue[index].speedText = updatedSpeedText
-                            uploadQueue[index].etaText = updatedETAText
-                            lastValidSpeedText[id] = updatedSpeedText
-                            lastValidETAText[id] = updatedETAText
-                            lastValidSpeedTime[id] = now
-                        } else {
-                            // No valid window now: use last known good within grace period
-                            let lastTime = lastValidSpeedTime[id] ?? 0
-                            if now - lastTime <= graceTimeoutSeconds, let lastSpeed = lastValidSpeedText[id], let lastETA = lastValidETAText[id] {
-                                uploadQueue[index].speedText = lastSpeed
-                                uploadQueue[index].etaText = lastETA
-                            } else {
-                                // Grace expired or none recorded: show minimal fallback, not nil
-                                uploadQueue[index].speedText = "0 B/s"
-                                uploadQueue[index].etaText = "--"
-                            }
-                        }
+                        updateUIProgress(sent: sent, total: total)
                     }
                 }
             )
@@ -771,9 +822,9 @@ struct ContentView: View {
                     }
                 } catch {
                     await MainActor.run {
-                        if uploadQueue.indices.contains(index) {
-                            uploadQueue[index].state = .failed("Thumbnail generation/upload failed: \(error.localizedDescription)")
-                            uploadQueue[index].endTime = Date()
+                        if let idx = uploadQueue.firstIndex(where: { $0.id == itemId }) {
+                            uploadQueue[idx].state = .failed("Thumbnail generation/upload failed: \(error.localizedDescription)")
+                            uploadQueue[idx].endTime = Date()
                         }
                         outputText += "\n❌ Thumbnail error for \(url.lastPathComponent): \(error.localizedDescription)"
                     }
@@ -784,35 +835,35 @@ struct ContentView: View {
             try Task.checkCancellation()
 
             await MainActor.run {
-                if uploadQueue.indices.contains(index) {
-                    uploadQueue[index].state = .completed
-                    uploadQueue[index].endTime = Date()
-                    uploadQueue[index].progress = 1.0
-                    uploadQueue[index].speedText = nil
-                    uploadQueue[index].etaText = nil
+                if let idx = uploadQueue.firstIndex(where: { $0.id == itemId }) {
+                    uploadQueue[idx].state = .completed
+                    uploadQueue[idx].endTime = Date()
+                    uploadQueue[idx].progress = 1.0
+                    uploadQueue[idx].speedText = nil
+                    uploadQueue[idx].etaText = nil
                 }
                 outputText += "\n✅ Upload complete!"
                 runError = nil
             }
         } catch is CancellationError {
             await MainActor.run {
-                if uploadQueue.indices.contains(index) {
-                    uploadQueue[index].state = .cancelled
-                    uploadQueue[index].endTime = Date()
-                    uploadQueue[index].speedText = nil
-                    uploadQueue[index].etaText = nil
+                if let idx = uploadQueue.firstIndex(where: { $0.id == itemId }) {
+                    uploadQueue[idx].state = .cancelled
+                    uploadQueue[idx].endTime = Date()
+                    uploadQueue[idx].speedText = nil
+                    uploadQueue[idx].etaText = nil
                 }
             }
         } catch {
             await MainActor.run {
-                if uploadQueue.indices.contains(index) {
-                    if case .failed = uploadQueue[index].state {
+                if let idx = uploadQueue.firstIndex(where: { $0.id == itemId }) {
+                    if case .failed = uploadQueue[idx].state {
                     } else {
-                        uploadQueue[index].state = .failed(error.localizedDescription)
+                        uploadQueue[idx].state = .failed(error.localizedDescription)
                     }
-                    uploadQueue[index].endTime = Date()
-                    uploadQueue[index].speedText = nil
-                    uploadQueue[index].etaText = nil
+                    uploadQueue[idx].endTime = Date()
+                    uploadQueue[idx].speedText = nil
+                    uploadQueue[idx].etaText = nil
                 }
                 runError = error.localizedDescription
                 outputText += "\n❌ Error: \(error.localizedDescription)"
